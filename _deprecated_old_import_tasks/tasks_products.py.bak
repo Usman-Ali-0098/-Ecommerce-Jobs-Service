@@ -1,0 +1,387 @@
+import logging
+import re
+
+from sqlalchemy import text
+
+from app.celery_app import celery_app
+from app.db import engine
+from app.ids import new_id
+from app.job_store import finalize_job_from_items, mark_item_result
+
+logger = logging.getLogger(__name__)
+
+
+class ImportValidationError(Exception):
+    """A product row that fails validation — reported on its JobRunItem,
+    never raised up as a task failure (one bad row shouldn't retry or block
+    the rest of the batch)."""
+
+
+def _slugify(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return slug or "product"
+
+
+def _unique_slug(conn, name: str) -> str:
+    base = _slugify(name)
+    candidate = base
+    counter = 2
+    while True:
+        exists = conn.execute(text('SELECT 1 FROM "Product" WHERE slug = :slug'), {"slug": candidate}).fetchone()
+        if not exists:
+            return candidate
+        candidate = f"{base}-{counter}"
+        counter += 1
+
+
+def _insert_product(conn, product: dict) -> str:
+    """Mirrors the Next.js app's POST /api/admin/products validation +
+    insert (product.service pattern) — same rules, raw SQL instead of
+    Prisma, one product per call. Raises ImportValidationError on any rule
+    violation; the transaction this runs in gets rolled back by the caller."""
+    name = (product.get("name") or "").strip()
+    if not name:
+        raise ImportValidationError("Product name is required.")
+
+    category_id = product.get("categoryId")
+    if not category_id:
+        raise ImportValidationError("Category is required.")
+
+    category = conn.execute(
+        text('SELECT id FROM "Category" WHERE id = :id AND "isActive" = true'),
+        {"id": category_id},
+    ).fetchone()
+    if not category:
+        raise ImportValidationError("Selected category does not exist or is inactive.")
+
+    variants = product.get("variants") or []
+    if not variants:
+        raise ImportValidationError("At least one variant is required.")
+
+    skus = [str(v.get("sku") or "").strip().upper() for v in variants]
+    if any(not sku for sku in skus):
+        raise ImportValidationError("Every variant requires a SKU.")
+    if len(set(skus)) != len(skus):
+        raise ImportValidationError("Duplicate SKU within this product.")
+
+    existing = conn.execute(
+        text('SELECT sku FROM "ProductVariant" WHERE sku = ANY(:skus)'),
+        {"skus": skus},
+    ).fetchone()
+    if existing:
+        raise ImportValidationError(f"SKU {existing.sku} already exists.")
+
+    color_ids = {v["colorId"] for v in variants if v.get("colorId")}
+    if color_ids:
+        count = conn.execute(
+            text('SELECT COUNT(*) FROM "Color" WHERE id = ANY(:ids) AND "isActive" = true'),
+            {"ids": list(color_ids)},
+        ).scalar()
+        if count != len(color_ids):
+            raise ImportValidationError("One or more colors are invalid or inactive.")
+
+    size_ids = {v["sizeId"] for v in variants if v.get("sizeId")}
+    if size_ids:
+        count = conn.execute(
+            text('SELECT COUNT(*) FROM "Size" WHERE id = ANY(:ids) AND "isActive" = true'),
+            {"ids": list(size_ids)},
+        ).scalar()
+        if count != len(size_ids):
+            raise ImportValidationError("One or more sizes are invalid or inactive.")
+
+    images = product.get("images") or []
+    primary_count = sum(1 for img in images if img.get("isPrimary"))
+    if images and primary_count != 1:
+        raise ImportValidationError("Exactly one primary image is required when images are provided.")
+
+    prices, stocks = [], []
+    for v in variants:
+        try:
+            price = int(v["price"])
+            stock = int(v["stock"])
+        except (KeyError, TypeError, ValueError):
+            raise ImportValidationError(f"Invalid price/stock for SKU {v.get('sku')}.")
+        if price <= 0:
+            raise ImportValidationError(f"Price must be a positive whole number for SKU {v.get('sku')}.")
+        if stock < 0:
+            raise ImportValidationError(f"Stock cannot be negative for SKU {v.get('sku')}.")
+        prices.append(price)
+        stocks.append(stock)
+
+    slug = _unique_slug(conn, name)
+    product_id = new_id()
+
+    conn.execute(
+        text(
+            """
+            INSERT INTO "Product" (id, name, slug, description, "categoryId", "isActive", "createdAt", "updatedAt")
+            VALUES (:id, :name, :slug, :description, :category_id, :is_active, now(), now())
+            """
+        ),
+        {
+            "id": product_id,
+            "name": name,
+            "slug": slug,
+            "description": (product.get("description") or "").strip() or None,
+            "category_id": category_id,
+            "is_active": bool(product.get("isActive", True)),
+        },
+    )
+
+    for index, image in enumerate(images):
+        conn.execute(
+            text(
+                """
+                INSERT INTO "ProductImage" (id, "productId", url, "altText", position, "isPrimary", "publicId", "colorId")
+                VALUES (:id, :product_id, :url, :alt_text, :position, :is_primary, :public_id, :color_id)
+                """
+            ),
+            {
+                "id": new_id(),
+                "product_id": product_id,
+                "url": image["url"],
+                "alt_text": name,
+                "position": image.get("position", index),
+                "is_primary": bool(image.get("isPrimary", False)),
+                "public_id": image.get("publicId"),
+                "color_id": image.get("colorId"),
+            },
+        )
+
+    for v, price, stock in zip(variants, prices, stocks):
+        conn.execute(
+            text(
+                """
+                INSERT INTO "ProductVariant"
+                    (id, "productId", "colorId", "sizeId", sku, price, stock, "isActive", "createdAt", "updatedAt", "imageUrl", "imagePublicId")
+                VALUES
+                    (:id, :product_id, :color_id, :size_id, :sku, :price, :stock, true, now(), now(), :image_url, :image_public_id)
+                """
+            ),
+            {
+                "id": new_id(),
+                "product_id": product_id,
+                "color_id": v.get("colorId"),
+                "size_id": v.get("sizeId"),
+                "sku": str(v["sku"]).strip().upper(),
+                "price": price,
+                "stock": stock,
+                "image_url": v.get("imageUrl"),
+                "image_public_id": v.get("imagePublicId"),
+            },
+        )
+
+    return product_id
+
+
+def _update_product(conn, product: dict, product_id: str) -> str:
+    """Runs when one or more of this product's variant SKUs already exist in
+    the catalog. Updates the matched Product's fields, upserts each variant
+    by SKU (existing ones get price/stock/color/size updated in place, new
+    SKUs are inserted under the same product), and appends any newly
+    uploaded images without touching the ones already there — mirrors the
+    admin UI's "Product Images (optional — keep existing)" promise."""
+    name = (product.get("name") or "").strip()
+    if not name:
+        raise ImportValidationError("Product name is required.")
+
+    category_id = product.get("categoryId")
+    if not category_id:
+        raise ImportValidationError("Category is required.")
+
+    category = conn.execute(
+        text('SELECT id FROM "Category" WHERE id = :id AND "isActive" = true'),
+        {"id": category_id},
+    ).fetchone()
+    if not category:
+        raise ImportValidationError("Selected category does not exist or is inactive.")
+
+    variants = product.get("variants") or []
+    if not variants:
+        raise ImportValidationError("At least one variant is required.")
+
+    skus = [str(v.get("sku") or "").strip().upper() for v in variants]
+    if any(not sku for sku in skus):
+        raise ImportValidationError("Every variant requires a SKU.")
+    if len(set(skus)) != len(skus):
+        raise ImportValidationError("Duplicate SKU within this product.")
+
+    existing_rows = conn.execute(
+        text('SELECT sku, "productId" FROM "ProductVariant" WHERE sku = ANY(:skus)'),
+        {"skus": skus},
+    ).fetchall()
+    other_products = {row.productId for row in existing_rows if row.productId != product_id}
+    if other_products:
+        raise ImportValidationError("These SKUs belong to more than one existing product.")
+    existing_skus = {row.sku for row in existing_rows}
+
+    color_ids = {v["colorId"] for v in variants if v.get("colorId")}
+    if color_ids:
+        count = conn.execute(
+            text('SELECT COUNT(*) FROM "Color" WHERE id = ANY(:ids) AND "isActive" = true'),
+            {"ids": list(color_ids)},
+        ).scalar()
+        if count != len(color_ids):
+            raise ImportValidationError("One or more colors are invalid or inactive.")
+
+    size_ids = {v["sizeId"] for v in variants if v.get("sizeId")}
+    if size_ids:
+        count = conn.execute(
+            text('SELECT COUNT(*) FROM "Size" WHERE id = ANY(:ids) AND "isActive" = true'),
+            {"ids": list(size_ids)},
+        ).scalar()
+        if count != len(size_ids):
+            raise ImportValidationError("One or more sizes are invalid or inactive.")
+
+    prices, stocks = [], []
+    for v in variants:
+        try:
+            price = int(v["price"])
+            stock = int(v["stock"])
+        except (KeyError, TypeError, ValueError):
+            raise ImportValidationError(f"Invalid price/stock for SKU {v.get('sku')}.")
+        if price <= 0:
+            raise ImportValidationError(f"Price must be a positive whole number for SKU {v.get('sku')}.")
+        if stock < 0:
+            raise ImportValidationError(f"Stock cannot be negative for SKU {v.get('sku')}.")
+        prices.append(price)
+        stocks.append(stock)
+
+    conn.execute(
+        text(
+            """
+            UPDATE "Product"
+            SET name = :name, description = :description, "categoryId" = :category_id,
+                "isActive" = :is_active, "updatedAt" = now()
+            WHERE id = :id
+            """
+        ),
+        {
+            "id": product_id,
+            "name": name,
+            "description": (product.get("description") or "").strip() or None,
+            "category_id": category_id,
+            "is_active": bool(product.get("isActive", True)),
+        },
+    )
+
+    images = product.get("images") or []
+    existing_image_count = conn.execute(
+        text('SELECT COUNT(*) FROM "ProductImage" WHERE "productId" = :id'),
+        {"id": product_id},
+    ).scalar()
+    for index, image in enumerate(images):
+        conn.execute(
+            text(
+                """
+                INSERT INTO "ProductImage" (id, "productId", url, "altText", position, "isPrimary", "publicId", "colorId")
+                VALUES (:id, :product_id, :url, :alt_text, :position, :is_primary, :public_id, :color_id)
+                """
+            ),
+            {
+                "id": new_id(),
+                "product_id": product_id,
+                "url": image["url"],
+                "alt_text": name,
+                "position": existing_image_count + index,
+                # Only let a new image claim "primary" if this product had no
+                # images at all before — never demote an existing primary.
+                "is_primary": bool(image.get("isPrimary", False)) and existing_image_count == 0,
+                "public_id": image.get("publicId"),
+                "color_id": image.get("colorId"),
+            },
+        )
+
+    for v, sku, price, stock in zip(variants, skus, prices, stocks):
+        if sku in existing_skus:
+            conn.execute(
+                text(
+                    """
+                    UPDATE "ProductVariant"
+                    SET "colorId" = :color_id, "sizeId" = :size_id, price = :price, stock = :stock,
+                        "imageUrl" = COALESCE(:image_url, "imageUrl"),
+                        "imagePublicId" = COALESCE(:image_public_id, "imagePublicId"),
+                        "updatedAt" = now()
+                    WHERE sku = :sku
+                    """
+                ),
+                {
+                    "sku": sku,
+                    "color_id": v.get("colorId"),
+                    "size_id": v.get("sizeId"),
+                    "price": price,
+                    "stock": stock,
+                    "image_url": v.get("imageUrl"),
+                    "image_public_id": v.get("imagePublicId"),
+                },
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO "ProductVariant"
+                        (id, "productId", "colorId", "sizeId", sku, price, stock, "isActive", "createdAt", "updatedAt", "imageUrl", "imagePublicId")
+                    VALUES
+                        (:id, :product_id, :color_id, :size_id, :sku, :price, :stock, true, now(), now(), :image_url, :image_public_id)
+                    """
+                ),
+                {
+                    "id": new_id(),
+                    "product_id": product_id,
+                    "color_id": v.get("colorId"),
+                    "size_id": v.get("sizeId"),
+                    "sku": sku,
+                    "price": price,
+                    "stock": stock,
+                    "image_url": v.get("imageUrl"),
+                    "image_public_id": v.get("imagePublicId"),
+                },
+            )
+
+    return product_id
+
+
+@celery_app.task(name="app.tasks_products.import_one_product")
+def import_one_product(job_run_id: str, item_id: str, product: dict):
+    """One product per task — isolates a bad row from the rest of the batch
+    (each product gets its own transaction) and lets many products import in
+    parallel across workers. No automatic retry: a validation failure will
+    fail the same way again, and retrying a partially-applied insert risks
+    duplicate products, so failures are reported on the JobRunItem for the
+    admin to fix and re-submit rather than retried blindly.
+
+    If any variant SKU already exists in the catalog, this updates that
+    existing product instead of trying (and failing) to create a new one —
+    the admin review screen shows this in advance via
+    POST /api/admin/products/check-skus."""
+    try:
+        try:
+            with engine.begin() as conn:
+                variants = product.get("variants") or []
+                skus = [str(v.get("sku") or "").strip().upper() for v in variants if v.get("sku")]
+                existing = conn.execute(
+                    text('SELECT DISTINCT "productId" FROM "ProductVariant" WHERE sku = ANY(:skus)'),
+                    {"skus": skus},
+                ).fetchall()
+                existing_product_ids = {row.productId for row in existing}
+
+                if len(existing_product_ids) > 1:
+                    raise ImportValidationError("These SKUs belong to more than one existing product.")
+                elif existing_product_ids:
+                    product_id = _update_product(conn, product, next(iter(existing_product_ids)))
+                    action = "Updated"
+                else:
+                    product_id = _insert_product(conn, product)
+                    action = "Created"
+            with engine.begin() as conn:
+                mark_item_result(conn, item_id, "COMPLETED", message=f"{action} \"{product.get('name')}\"", product_id=product_id)
+        except ImportValidationError as exc:
+            with engine.begin() as conn:
+                mark_item_result(conn, item_id, "FAILED", message=str(exc))
+    except Exception as exc:  # noqa: BLE001 - unexpected/DB error, report and move on
+        logger.exception("import_one_product: unexpected error for item %s", item_id)
+        with engine.begin() as conn:
+            mark_item_result(conn, item_id, "FAILED", message=f"Unexpected error: {exc}")
+    finally:
+        with engine.begin() as conn:
+            finalize_job_from_items(conn, job_run_id)

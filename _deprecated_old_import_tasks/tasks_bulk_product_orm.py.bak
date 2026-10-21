@@ -1,0 +1,62 @@
+"""SQLAlchemy ORM product import task used by CSV bulk uploads."""
+import logging
+from datetime import datetime
+
+from celery import group
+from sqlalchemy import func, select
+
+from app.celery_app import celery_app
+from app.db import SessionLocal
+from app.models import JobRunItemModel, JobRunModel
+from app.next_notify import notify_nextjs_if_finished
+from app.product_import_orm import ImportValidationError, finalize_job_progress, import_product
+
+logger = logging.getLogger(__name__)
+
+
+@celery_app.task(name="app.tasks_bulk_upload.import_one_csv_product")
+def import_one_csv_product(job_run_id: str, item_id: str, product: dict):
+    try:
+        with SessionLocal.begin() as session:
+            item = session.get(JobRunItemModel, item_id)
+            if not item or item.status in ("COMPLETED", "FAILED"):
+                return
+            item.status = "PROCESSING"
+            item.attempt += 1
+            item.updated_at = datetime.utcnow()
+            job = session.get(JobRunModel, job_run_id)
+            if job:
+                job.heartbeat_at = datetime.utcnow()
+                job.updated_at = datetime.utcnow()
+
+        with SessionLocal.begin() as session:
+            product_id, action = import_product(session, product)
+
+        with SessionLocal.begin() as session:
+            item = session.get(JobRunItemModel, item_id)
+            if item:
+                item.status = "COMPLETED"
+                item.message = '%s "%s"' % (action, product.get("name", ""))
+                item.product_id = product_id
+                item.updated_at = datetime.utcnow()
+            finalize_job_progress(session, job_run_id)
+    except ImportValidationError as exc:
+        with SessionLocal.begin() as session:
+            item = session.get(JobRunItemModel, item_id)
+            if item:
+                item.status = "FAILED"
+                item.message = str(exc)[:2000]
+                item.updated_at = datetime.utcnow()
+            finalize_job_progress(session, job_run_id)
+    except Exception as exc:
+        logger.exception("CSV product import failed for item %s", item_id)
+        with SessionLocal.begin() as session:
+            item = session.get(JobRunItemModel, item_id)
+            if item:
+                item.status = "FAILED"
+                item.message = "Unexpected error while importing product."
+                item.updated_at = datetime.utcnow()
+            finalize_job_progress(session, job_run_id)
+
+    notify_nextjs_if_finished(job_run_id)
+    return {"jobId": job_run_id, "itemId": item_id}
