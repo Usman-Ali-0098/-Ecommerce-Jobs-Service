@@ -27,24 +27,43 @@ Three things live here:
    `send_email_task` used above. This is the single scheduling authority for
    order expiry — the Next.js app's `/api/cron/release-stock` route has been
    retired in favor of this.
-3. **Bulk product import** — the Next.js admin CSV-import page
-   (`/admin/products/import`) resolves category/color/size names to ids and
-   uploads any images to Cloudinary itself, then POSTs the final
-   `{products: [...]}` array to `POST /jobs/products/import`. This service
-   creates one `JobRunItem` per product plus one `import_one_product` Celery
-   task per product (so a bad row doesn't block the rest of the batch and
-   products import in parallel across workers), and rolls the parent
-   `JobRun` up to COMPLETED/PARTIAL/FAILED once every item is done. The
-   admin page polls `GET /api/admin/jobs/[id]` (Next.js reading `JobRun` +
-   `JobRunItem` via Prisma) to show live per-row progress.
+3. **Bulk product import** — the browser uploads the CSV directly to
+   Cloudinary using a signed credential Next.js issues
+   (`/api/admin/upload/csv-signature`); Next.js then creates one `JobRun`
+   row pointing at that Cloudinary URL and calls `POST /jobs/bulk-upload`
+   with just its id (`/api/admin/upload/csv-initiate`). This service streams
+   the CSV straight from its Cloudinary URL — never loading the whole file
+   into memory — grouping adjacent rows into products and processing them in
+   chunks (`PRODUCTS_PER_CHUNK` products at a time, see
+   `app/tasks_bulk_upload.py`). Each chunk runs three phases: validate every
+   row first with zero I/O, then resolve/upload only the images still-valid
+   rows need (deduplicated and cached for the whole job, uploaded through one
+   shared thread pool), then write the whole chunk in a single transaction
+   with each product in its own savepoint — one bad product never blocks or
+   rolls back the rest of its chunk. One `JobRunItem` is written per product;
+   a failed item also saves the row's original field values (`rawRow`) so
+   the admin can fix and resubmit just that one product through the existing
+   single-product form, without touching the rest of the job. `JobRun` rolls
+   up to COMPLETED/PARTIAL/FAILED as chunks complete. The admin page polls
+   `GET /api/admin/jobs/[id]` (Next.js reading `JobRun` + `JobRunItem` via
+   Prisma) to show live progress grouped by chunk.
 
-## Why SQLAlchemy Core instead of ORM models
+## Why this service mixes raw SQL and ORM models
 
-This service only runs a handful of parametrized `UPDATE`/`INSERT`/`SELECT`
-statements against tables it doesn't own. Raw, explicit SQL against exact
-column names is less to keep in sync than a full duplicate ORM model set
-mirroring `schema.prisma` — every column referenced is visible directly in
-`app/tasks_orders.py` / `app/job_store.py`.
+Email dispatch and the order-expiry sweep (`app/job_store.py`,
+`app/tasks_orders.py`, `app/tasks_email.py`, `app/tasks_knowledge.py`) use
+raw, parametrized SQL via SQLAlchemy Core (`text(...)`) — each only touches
+a handful of known columns on tables it doesn't own, so explicit SQL is less
+to keep in sync than a duplicate ORM model would be.
+
+Bulk CSV import (`app/tasks_bulk_upload.py`, `app/product_import_orm.py`,
+`app/models.py`) is the opposite: it reads and writes several related tables
+at once (`Category`, `Color`, `Size`, `Product`, `ProductVariant`,
+`ProductImage`, `JobRun`, `JobRunItem`) with real relationships, upserts, and
+per-product savepoint/rollback logic. For that shape of problem, full
+SQLAlchemy ORM declarative models are what's actually declared in
+`app/models.py` and used throughout — hand-written raw SQL for every one of
+those branches would be far more error-prone to get right and keep correct.
 
 ## Setup
 
@@ -79,7 +98,7 @@ celery -A app.celery_app worker --loglevel=info --pool=solo
 celery -A app.celery_app beat --loglevel=info
 
 # 3. FastAPI — the HTTP API Next.js calls (POST /jobs/email,
-#    POST /jobs/products/import, POST /sweep)
+#    POST /jobs/bulk-upload, POST /sweep)
 uvicorn app.main:app --reload --port 8001
 ```
 
